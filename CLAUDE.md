@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A single-file Tic Tac Toe game: `tictactoe.html`. Open it directly in any browser — no build step, no dependencies, no server required.
 
+## Git Workflow
+
+- Always create a new branch for each feature (`git checkout -b feature/<name>`)
+- Commit changes on the branch so work can be reverted if needed
+- Never commit directly to `master`
+
 ## Architecture
 
 All logic lives in one file:
