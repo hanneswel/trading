@@ -3,7 +3,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import Market, OrderBook, OrderLevel
+from .models import EstimationResult, Market, OrderBook, OrderLevel
 
 DEFAULT_DB = "markets.db"
 
@@ -49,6 +49,27 @@ CREATE INDEX IF NOT EXISTS idx_markets_volume ON markets(volume DESC);
 CREATE INDEX IF NOT EXISTS idx_markets_liquidity ON markets(liquidity DESC);
 CREATE INDEX IF NOT EXISTS idx_order_books_condition ON order_books(market_condition_id);
 CREATE INDEX IF NOT EXISTS idx_order_books_fetched ON order_books(fetched_at DESC);
+
+CREATE TABLE IF NOT EXISTS estimations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id TEXT NOT NULL,
+    market_question TEXT NOT NULL,
+    model_probability REAL NOT NULL,
+    confidence TEXT NOT NULL,
+    reasoning TEXT NOT NULL,
+    factors_for TEXT NOT NULL,
+    factors_against TEXT NOT NULL,
+    sources TEXT NOT NULL,
+    market_price REAL NOT NULL,
+    model_name TEXT NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    search_count INTEGER,
+    estimated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_estimations_market ON estimations(market_id);
+CREATE INDEX IF NOT EXISTS idx_estimations_time ON estimations(estimated_at DESC);
 """
 
 
@@ -180,4 +201,67 @@ def get_latest_order_book(
         last_trade_price=row["last_trade_price"],
         timestamp=row["timestamp"],
         fetched_at=datetime.fromisoformat(row["fetched_at"]),
+    )
+
+
+def insert_estimation(conn: sqlite3.Connection, est: EstimationResult) -> None:
+    conn.execute(
+        """INSERT INTO estimations
+        (market_id, market_question, model_probability, confidence, reasoning,
+         factors_for, factors_against, sources, market_price, model_name,
+         input_tokens, output_tokens, search_count, estimated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            est.market_id,
+            est.market_question,
+            est.model_probability,
+            est.confidence,
+            est.reasoning,
+            json.dumps(est.factors_for),
+            json.dumps(est.factors_against),
+            json.dumps(est.sources),
+            est.market_price,
+            est.model_name,
+            est.input_tokens,
+            est.output_tokens,
+            est.search_count,
+            est.estimated_at.isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def get_cached_estimation(
+    conn: sqlite3.Connection, market_id: str, ttl_hours: float = 6.0
+) -> EstimationResult | None:
+    """Return the most recent estimation if it's within the TTL window."""
+    row = conn.execute(
+        """SELECT * FROM estimations
+        WHERE market_id = ?
+        ORDER BY estimated_at DESC LIMIT 1""",
+        (market_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    estimated_at = datetime.fromisoformat(row["estimated_at"])
+    if not estimated_at.tzinfo:
+        estimated_at = estimated_at.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - estimated_at).total_seconds() / 3600
+    if age_hours > ttl_hours:
+        return None
+    return EstimationResult(
+        market_id=row["market_id"],
+        market_question=row["market_question"],
+        model_probability=row["model_probability"],
+        confidence=row["confidence"],
+        reasoning=row["reasoning"],
+        factors_for=json.loads(row["factors_for"]),
+        factors_against=json.loads(row["factors_against"]),
+        sources=json.loads(row["sources"]),
+        market_price=row["market_price"],
+        model_name=row["model_name"],
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        search_count=row["search_count"],
+        estimated_at=estimated_at,
     )
