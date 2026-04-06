@@ -8,11 +8,18 @@ import anthropic
 
 from .db import get_cached_estimation, insert_estimation
 from .models import EstimationResult, Market
-from .prompts import ESTIMATION_JSON_SCHEMA, SYSTEM_PROMPT, build_user_prompt
+from .prompts import (
+    ESTIMATION_JSON_SCHEMA,
+    SCREEN_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    build_screen_user_prompt,
+    build_user_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-sonnet-4-20250514"
+SCREEN_MODEL = "claude-haiku-4-5-20251001"
 MAX_CONCURRENT = 5
 
 
@@ -90,7 +97,7 @@ def estimate_market(
     market: Market,
     *,
     model: str = DEFAULT_MODEL,
-    max_searches: int = 5,
+    max_searches: int = 3,
 ) -> EstimationResult:
     """Run a single market estimation with web search."""
     user_prompt = build_user_prompt(market)
@@ -126,6 +133,144 @@ def estimate_market(
     )
 
     return result
+
+
+def screen_market(
+    client: anthropic.Anthropic,
+    market: Market,
+    *,
+    model: str = SCREEN_MODEL,
+) -> EstimationResult:
+    """Run a cheap screening estimation without web search."""
+    user_prompt = build_screen_user_prompt(market)
+
+    logger.info("Screening market: %s", market.question[:80])
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=512,
+        system=SCREEN_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+
+    result = _parse_response(response, market, model)
+    result.stage = "screen"
+
+    logger.info(
+        "Screen: %s | Model: %.2f | Market: %.2f | Div: %+.2f | Conf: %s",
+        market.question[:50],
+        result.model_probability,
+        result.market_price,
+        result.model_probability - result.market_price,
+        result.confidence,
+    )
+
+    return result
+
+
+async def screen_and_estimate_markets(
+    markets: list[Market],
+    conn: sqlite3.Connection,
+    *,
+    screen_model: str = SCREEN_MODEL,
+    deep_model: str = DEFAULT_MODEL,
+    max_searches: int = 3,
+    ttl_hours: float = 12.0,
+    max_concurrent: int = MAX_CONCURRENT,
+    pre_threshold: float = 0.08,
+) -> list[EstimationResult]:
+    """Two-stage estimation: cheap Haiku screen, then Sonnet+search for divergent markets."""
+    client = anthropic.Anthropic()
+    sem = asyncio.Semaphore(max_concurrent)
+    results: list[EstimationResult] = []
+
+    # Stage 0: Check cache for deep results
+    uncached_markets: list[Market] = []
+    for market in markets:
+        cached = get_cached_estimation(conn, market.id, ttl_hours)
+        if cached:
+            logger.info("Using cached estimation for: %s", market.question[:60])
+            results.append(cached)
+        else:
+            uncached_markets.append(market)
+
+    if not uncached_markets:
+        logger.info("All %d markets served from cache", len(results))
+        return results
+
+    logger.info("Screening %d uncached markets with %s", len(uncached_markets), screen_model)
+
+    # Stage 1: Screen all uncached markets with Haiku (no web search)
+    async def _screen_one(market: Market) -> EstimationResult | None:
+        async with sem:
+            try:
+                return await asyncio.to_thread(
+                    screen_market, client, market, model=screen_model
+                )
+            except (anthropic.APIError, json.JSONDecodeError, ValueError) as e:
+                logger.error("Failed to screen market %s: %s", market.id, e)
+                return None
+
+    screen_tasks = [_screen_one(m) for m in uncached_markets]
+    screen_results = await asyncio.gather(*screen_tasks)
+
+    # Stage 1 results: filter for deep analysis
+    promote_markets: list[Market] = []
+    for market, screen_result in zip(uncached_markets, screen_results):
+        if screen_result is None:
+            continue
+        market_price = market.outcome_prices[0] if market.outcome_prices else 0.0
+        divergence = abs(screen_result.model_probability - market_price)
+        if divergence >= pre_threshold:
+            promote_markets.append(market)
+            logger.info(
+                "Promoting to deep: %s (screen div: %.3f)", market.question[:50], divergence
+            )
+        else:
+            results.append(screen_result)
+
+    logger.info(
+        "Screen complete: %d screened, %d promoted to deep analysis",
+        len(uncached_markets), len(promote_markets),
+    )
+
+    if not promote_markets:
+        return results
+
+    # Stage 2: Deep estimation with Sonnet + web search
+    async def _deep_one(market: Market) -> EstimationResult | None:
+        async with sem:
+            try:
+                result = await asyncio.to_thread(
+                    estimate_market, client, market, model=deep_model, max_searches=max_searches
+                )
+                insert_estimation(conn, result)
+                return result
+            except anthropic.RateLimitError as e:
+                logger.warning("Rate limited estimating %s: %s", market.id, e)
+                await asyncio.sleep(10)
+                try:
+                    result = await asyncio.to_thread(
+                        estimate_market, client, market, model=deep_model, max_searches=max_searches
+                    )
+                    insert_estimation(conn, result)
+                    return result
+                except Exception:
+                    logger.exception("Retry failed for market %s", market.id)
+                    return None
+            except (anthropic.APIError, json.JSONDecodeError, ValueError) as e:
+                logger.error("Failed to estimate market %s: %s", market.id, e)
+                return None
+
+    deep_tasks = [_deep_one(m) for m in promote_markets]
+    deep_results = await asyncio.gather(*deep_tasks)
+
+    for r in deep_results:
+        if r is not None:
+            results.append(r)
+
+    logger.info("Completed %d total estimations (%d deep)", len(results), len(promote_markets))
+    return results
 
 
 async def estimate_markets(

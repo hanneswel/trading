@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS estimations (
     input_tokens INTEGER,
     output_tokens INTEGER,
     search_count INTEGER,
+    stage TEXT DEFAULT 'deep',
     estimated_at TEXT NOT NULL
 );
 
@@ -77,6 +78,12 @@ def init_db(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # Migrate: add stage column to existing estimations tables
+    try:
+        conn.execute("ALTER TABLE estimations ADD COLUMN stage TEXT DEFAULT 'deep'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     return conn
 
@@ -209,8 +216,8 @@ def insert_estimation(conn: sqlite3.Connection, est: EstimationResult) -> None:
         """INSERT INTO estimations
         (market_id, market_question, model_probability, confidence, reasoning,
          factors_for, factors_against, sources, market_price, model_name,
-         input_tokens, output_tokens, search_count, estimated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+         input_tokens, output_tokens, search_count, stage, estimated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             est.market_id,
             est.market_question,
@@ -225,6 +232,7 @@ def insert_estimation(conn: sqlite3.Connection, est: EstimationResult) -> None:
             est.input_tokens,
             est.output_tokens,
             est.search_count,
+            est.stage,
             est.estimated_at.isoformat(),
         ),
     )
@@ -263,5 +271,6 @@ def get_cached_estimation(
         input_tokens=row["input_tokens"],
         output_tokens=row["output_tokens"],
         search_count=row["search_count"],
+        stage=row["stage"] or "deep",
         estimated_at=estimated_at,
     )

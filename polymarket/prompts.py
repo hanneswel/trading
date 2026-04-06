@@ -90,6 +90,70 @@ probability estimate as a JSON object.\
 """
 
 
+SCREEN_SYSTEM_PROMPT = """\
+You are a calibrated probability estimator for prediction markets. Your job is to \
+estimate the true probability of events resolving "Yes", given your existing knowledge.
+
+You will NOT have access to web search. Use your training knowledge and the market data provided.
+
+CALIBRATION RULES — follow these strictly:
+1. DO NOT anchor on the current market price. Assess the evidence independently first, \
+then compare to the market price only at the end.
+2. DO NOT round to convenient numbers (0.5, 0.7, 0.9, etc.). Use precise values like \
+0.63 or 0.41. Real-world probabilities are rarely round.
+3. DO NOT be overconfident. If information is sparse or conflicting, your probability \
+should reflect genuine uncertainty (closer to 0.5). A probability of 0.95+ requires \
+overwhelming evidence.
+4. Consider base rates first, then update based on specific evidence (Bayesian reasoning).
+5. Account for the possibility that you are wrong or missing information.
+
+OUTPUT FORMAT:
+You must respond with a JSON object matching this exact schema:
+{
+    "probability": 0.XX,
+    "confidence": "low|medium|high",
+    "reasoning": "1-2 sentence summary of your assessment"
+}
+
+Return ONLY the JSON object, no other text.\
+"""
+
+
+def build_screen_user_prompt(market: Market, current_date: datetime | None = None) -> str:
+    if current_date is None:
+        current_date = datetime.now(timezone.utc)
+
+    date_str = current_date.strftime("%Y-%m-%d")
+    yes_price = market.outcome_prices[0] if market.outcome_prices else "unknown"
+    no_price = market.outcome_prices[1] if len(market.outcome_prices) > 1 else "unknown"
+
+    description = market.description or "No additional description provided."
+    if len(description) > 1000:
+        description = description[:1000] + "..."
+
+    end_date_str = ""
+    if market.end_date:
+        end_date_str = f"\nResolution deadline: {market.end_date}"
+
+    return f"""\
+Estimate the probability that the following prediction market resolves "Yes".
+
+MARKET QUESTION: {market.question}
+
+DESCRIPTION / RESOLUTION CRITERIA:
+{description}
+{end_date_str}
+TODAY'S DATE: {date_str}
+
+MARKET DATA (for context only — do NOT anchor on these prices):
+- Current "Yes" price: {yes_price}
+- Current "No" price: {no_price}
+- Total volume: ${market.volume:,.0f}
+
+Based on your knowledge, provide a quick probability estimate as a JSON object.\
+"""
+
+
 # JSON schema for structured output via Anthropic API
 ESTIMATION_JSON_SCHEMA = {
     "type": "object",

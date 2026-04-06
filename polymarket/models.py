@@ -60,6 +60,7 @@ class EstimationResult:
     input_tokens: int
     output_tokens: int
     search_count: int
+    stage: str = "deep"  # "screen" or "deep"
     estimated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
